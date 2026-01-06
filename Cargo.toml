@@ -24,6 +24,7 @@ default = []
 data = []
 gamma = []
 bridge = []
+rfq = []
 tracing = ["dep:tracing", "dep:serde_ignored"]
 ws = ["dep:backoff", "dep:bitflags", "dep:tokio", "dep:tokio-tungstenite"]
 rtds = ["dep:backoff", "dep:tokio", "dep:tokio-tungstenite"]
@@ -141,6 +142,16 @@ required-features = ["ws"]
 name = "websocket_user"
 path = "examples/clob/ws/user.rs"
 required-features = ["ws"]
+
+[[example]]
+name = "rfq_quotes"
+path = "examples/clob/rfq/quotes.rs"
+required-features = ["rfq"]
+
+[[example]]
+name = "rfq_requests"
+path = "examples/clob/rfq/requests.rs"
+required-features = ["rfq"]
 
 [[example]]
 name = "rtds_crypto_prices"
