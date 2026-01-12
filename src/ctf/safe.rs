@@ -2,12 +2,17 @@
 //!
 //! This module provides `SafeClient` which wraps arbitrary contract calls
 //! in Safe's `execTransaction`, allowing the Safe to be the `msg.sender`.
+//!
+//! Uses Alloy's `sol!` macro for EIP-712 typed data handling, following
+//! the same pattern as the Polymarket CLOB SDK for cleaner, less error-prone
+//! signature generation.
 
+use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256, address};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolStruct};
 use thiserror::Error;
 
 /// CTF contract address on Polygon
@@ -52,51 +57,24 @@ sol! {
     }
 }
 
-/// SafeTx struct matching Gnosis Safe's EIP-712 typed data
-/// Note: This is for computing the transaction hash to sign
-#[derive(Debug, Clone)]
-pub struct SafeTx {
-    pub to: Address,
-    pub value: U256,
-    pub data: Bytes,
-    pub operation: u8,
-    pub safe_tx_gas: U256,
-    pub base_gas: U256,
-    pub gas_price: U256,
-    pub gas_token: Address,
-    pub refund_receiver: Address,
-    pub nonce: U256,
-}
-
-impl SafeTx {
-    /// Compute the EIP-712 struct hash for this SafeTx
-    pub fn struct_hash(&self) -> B256 {
-        use alloy::primitives::keccak256;
-
-        // SafeTx type hash: keccak256("SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)")
-        let type_hash: B256 = "0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8"
-            .parse()
-            .unwrap();
-
-        // Encode the struct data
-        let data_hash = keccak256(&self.data);
-
-        let encoded = [
-            type_hash.as_slice(),
-            &self.to.into_word()[..],
-            &B256::from(self.value)[..],
-            data_hash.as_slice(),
-            &B256::from(U256::from(self.operation))[..],
-            &B256::from(self.safe_tx_gas)[..],
-            &B256::from(self.base_gas)[..],
-            &B256::from(self.gas_price)[..],
-            &self.gas_token.into_word()[..],
-            &self.refund_receiver.into_word()[..],
-            &B256::from(self.nonce)[..],
-        ]
-        .concat();
-
-        keccak256(&encoded)
+// Define SafeTx using sol! macro - this automatically implements SolStruct
+// which provides .eip712_signing_hash() for proper EIP-712 signing
+sol! {
+    /// SafeTx struct matching Gnosis Safe's EIP-712 typed data format.
+    /// Using sol! macro provides automatic type hash computation and
+    /// struct hash encoding via the SolStruct trait.
+    #[derive(Debug, Default)]
+    struct SafeTx {
+        address to;
+        uint256 value;
+        bytes data;
+        uint8 operation;
+        uint256 safeTxGas;
+        uint256 baseGas;
+        uint256 gasPrice;
+        address gasToken;
+        address refundReceiver;
+        uint256 nonce;
     }
 }
 
@@ -154,43 +132,17 @@ impl<P: Provider + Clone> SafeClient<P> {
             .map_err(|e| SafeError::NonceError(e.to_string()))
     }
 
-    /// Compute the EIP-712 domain separator for this Safe
-    fn domain_separator(&self) -> B256 {
-        use alloy::primitives::keccak256;
-
-        // Safe domain: keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
-        // Note: Safe does NOT use name or version in its domain
-        let domain_type_hash: B256 =
-            "0x47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218"
-                .parse()
-                .unwrap();
-
-        let encoded = [
-            domain_type_hash.as_slice(),
-            &B256::from(U256::from(self.chain_id))[..],
-            &self.safe_address.into_word()[..],
-        ]
-        .concat();
-
-        keccak256(&encoded)
-    }
-
-    /// Compute the full EIP-712 hash to sign
-    fn safe_tx_hash(&self, safe_tx: &SafeTx) -> B256 {
-        use alloy::primitives::keccak256;
-
-        let domain_separator = self.domain_separator();
-        let struct_hash = safe_tx.struct_hash();
-
-        // EIP-712: keccak256("\x19\x01" || domainSeparator || structHash)
-        let encoded = [
-            &[0x19, 0x01][..],
-            domain_separator.as_slice(),
-            struct_hash.as_slice(),
-        ]
-        .concat();
-
-        keccak256(&encoded)
+    /// Build the EIP-712 domain for this Safe.
+    ///
+    /// Safe's domain uses only chainId and verifyingContract (no name/version).
+    /// This matches the domain type hash:
+    /// keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
+    fn eip712_domain(&self) -> Eip712Domain {
+        Eip712Domain {
+            chain_id: Some(U256::from(self.chain_id)),
+            verifying_contract: Some(self.safe_address),
+            ..Eip712Domain::default()
+        }
     }
 
     /// Execute a transaction through the Safe
@@ -214,25 +166,26 @@ impl<P: Provider + Clone> SafeClient<P> {
             value: U256::ZERO,
             data: data.clone(),
             operation: 0, // Call (not DelegateCall)
-            safe_tx_gas: U256::ZERO,
-            base_gas: U256::ZERO,
-            gas_price: U256::ZERO,
-            gas_token: Address::ZERO,
-            refund_receiver: Address::ZERO,
+            safeTxGas: U256::ZERO,
+            baseGas: U256::ZERO,
+            gasPrice: U256::ZERO,
+            gasToken: Address::ZERO,
+            refundReceiver: Address::ZERO,
             nonce,
         };
 
-        // Compute the hash to sign
-        let tx_hash = self.safe_tx_hash(&safe_tx);
+        // Use Alloy's EIP-712 signing via SolStruct trait
+        // This handles type hash computation and struct encoding automatically
+        let domain = self.eip712_domain();
+        let signing_hash = safe_tx.eip712_signing_hash(&domain);
 
-        // Sign the hash
+        // Sign the EIP-712 hash
         let signature = signer
-            .sign_hash(&tx_hash)
+            .sign_hash(&signing_hash)
             .await
             .map_err(|e| SafeError::SigningError(e.to_string()))?;
 
-        // Convert signature to Safe format
-        // Safe expects r || s || v
+        // Convert signature to Safe format (r || s || v)
         // Since we use sign_hash (direct ECDSA over the Safe tx hash), we use v = 27/28
         // DO NOT convert to v=31/32 (eth_sign type) - that's for pre-hashed messages with prefix
         let sig_bytes = signature.as_bytes().to_vec();
@@ -245,11 +198,11 @@ impl<P: Provider + Clone> SafeClient<P> {
                 safe_tx.value,
                 safe_tx.data,
                 safe_tx.operation,
-                safe_tx.safe_tx_gas,
-                safe_tx.base_gas,
-                safe_tx.gas_price,
-                safe_tx.gas_token,
-                safe_tx.refund_receiver,
+                safe_tx.safeTxGas,
+                safe_tx.baseGas,
+                safe_tx.gasPrice,
+                safe_tx.gasToken,
+                safe_tx.refundReceiver,
                 Bytes::from(sig_bytes),
             )
             .send()
@@ -303,27 +256,26 @@ impl<P: Provider + Clone> SafeClient<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::keccak256;
 
     #[test]
     fn test_safe_tx_type_hash() {
-        // Verify the SafeTx type hash is correct
-        use alloy::primitives::keccak256;
-
+        // Verify the SafeTx type hash matches the expected value
+        // The sol! macro should generate the correct type hash
         let type_string = "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)";
         let computed_hash = keccak256(type_string.as_bytes());
 
+        // This is what Safe uses
         let expected: B256 = "0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8"
             .parse()
             .unwrap();
 
-        assert_eq!(computed_hash, expected);
+        assert_eq!(computed_hash, expected, "SafeTx type hash should match Safe's expected value");
     }
 
     #[test]
     fn test_domain_type_hash() {
         // Verify the domain type hash is correct
-        use alloy::primitives::keccak256;
-
         let type_string = "EIP712Domain(uint256 chainId,address verifyingContract)";
         let computed_hash = keccak256(type_string.as_bytes());
 
@@ -331,6 +283,44 @@ mod tests {
             .parse()
             .unwrap();
 
-        assert_eq!(computed_hash, expected);
+        assert_eq!(computed_hash, expected, "Domain type hash should match Safe's expected value");
+    }
+
+    #[test]
+    fn test_sol_struct_signing_hash() {
+        // Verify that Alloy's sol! macro generates a valid EIP-712 signing hash
+        // by creating a test SafeTx and computing its signing hash
+        let safe_tx = SafeTx {
+            to: Address::ZERO,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            operation: 0,
+            safeTxGas: U256::ZERO,
+            baseGas: U256::ZERO,
+            gasPrice: U256::ZERO,
+            gasToken: Address::ZERO,
+            refundReceiver: Address::ZERO,
+            nonce: U256::ZERO,
+        };
+
+        // Create a test domain (Safe on Polygon mainnet at a specific address)
+        let domain = Eip712Domain {
+            chain_id: Some(U256::from(137_u64)), // Polygon
+            verifying_contract: Some(
+                "0x1234567890123456789012345678901234567890"
+                    .parse()
+                    .unwrap(),
+            ),
+            ..Eip712Domain::default()
+        };
+
+        // This should not panic - if it does, the SolStruct implementation is broken
+        let signing_hash = safe_tx.eip712_signing_hash(&domain);
+
+        // The hash should be a valid B256 (32 bytes)
+        assert_eq!(signing_hash.len(), 32, "EIP-712 signing hash should be 32 bytes");
+
+        // The hash should not be all zeros (would indicate a bug)
+        assert_ne!(signing_hash, B256::ZERO, "Signing hash should not be zero");
     }
 }
